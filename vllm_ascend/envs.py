@@ -109,6 +109,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Whether to allocate KV Cache as a single contiguous memory block.
+    # When enabled, all layers' K and V caches are allocated in one contiguous
+    # tensor, allowing direct access to all layers' KV cache via a single tensor.
+    # This is only supported for homogeneous attention layers (same num_kv_heads,
+    # head_size, and dtype across all layers). Falls back to per-layer allocation
+    # for heterogeneous models (MLA, sparse attention, Mamba hybrid, etc.).
+    # Supports KV Transfer Config (prefill disaggregation) with 2MB alignment.
+    # Supports Shared KV Cache Layers (cross-layer KV sharing).
+    # Default: 0 (disabled)
+    "VLLM_ASCEND_CONTIGUOUS_KV_CACHE": lambda: bool(int(os.getenv("VLLM_ASCEND_CONTIGUOUS_KV_CACHE", "0"))),
 }
 
 # end-env-vars-definition

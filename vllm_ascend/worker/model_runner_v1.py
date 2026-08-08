@@ -19,13 +19,14 @@
 
 import math
 import sys
+import os
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from functools import partial
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, Dict
 
 import numpy as np
 import torch
@@ -90,6 +91,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -2588,6 +2590,10 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+            if os.environ.get("VLLM_ASCEND_ENABLE_PYPTO", "0") == "1":
+                model_inner = self.model.model
+                layer_list = list(model_inner.layers[model_inner.start_layer: model_inner.end_layer])
+                model_inner.weights = extract_layer_weights(layer_list, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
@@ -2645,6 +2651,156 @@ class NPUModelRunner(GPUModelRunner):
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
+
+    def _can_use_contiguous_kv_cache(self, kv_cache_config: KVCacheConfig) -> bool:
+        if not ascend_envs.VLLM_ASCEND_CONTIGUOUS_KV_CACHE:
+            return False
+
+        if self.use_sparse or self.use_sparse_c8_indexer:
+            logger.info("Contiguous KV cache disabled: sparse attention enabled")
+            return False
+
+        if self.hybrid_with_attn_and_mamba or self.use_hybrid_blocks:
+            logger.info("Contiguous KV cache disabled: hybrid blocks detected")
+            return False
+
+        if self.vllm_config.kv_transfer_config is not None:
+            logger.info("Contiguous KV cache disabled: kv_transfer_config present")
+            return False
+
+        if len(self.shared_kv_cache_layers) > 0:
+            logger.info("Contiguous KV cache disabled: shared KV cache layers detected")
+            return False
+
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        attn_specs: list[AttentionSpec] = []
+        attn_layer_names: list[str] = []
+
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                spec = layer_kv_cache_spec.get(layer_name)
+                if spec is None:
+                    continue
+                if isinstance(spec, MambaSpec):
+                    logger.info("Contiguous KV cache disabled: MambaSpec detected for %s", layer_name)
+                    return False
+                if isinstance(spec, MLAAttentionSpec):
+                    logger.info("Contiguous KV cache disabled: MLAAttentionSpec detected for %s", layer_name)
+                    return False
+                if isinstance(spec, AttentionSpec):
+                    attn_specs.append(spec)
+                    attn_layer_names.append(layer_name)
+
+        if len(attn_specs) == 0:
+            logger.info("Contiguous KV cache disabled: no attention layers found")
+            return False
+
+        first_spec = attn_specs[0]
+        first_head_size = first_spec.head_size
+        first_head_size_v = getattr(first_spec, "head_size_v", first_head_size)
+        first_num_kv_heads = first_spec.num_kv_heads
+        first_dtype = first_spec.dtype
+        first_block_size = first_spec.block_size
+
+        for i, spec in enumerate(attn_specs[1:], 1):
+            head_size = spec.head_size
+            head_size_v = getattr(spec, "head_size_v", head_size)
+            if (
+                head_size != first_head_size
+                or head_size_v != first_head_size_v
+                or spec.num_kv_heads != first_num_kv_heads
+                or spec.dtype != first_dtype
+                or spec.block_size != first_block_size
+            ):
+                logger.info(
+                    "Contiguous KV cache disabled: heterogeneous attention specs detected. "
+                    "Layer %s differs from layer %s",
+                    attn_layer_names[i],
+                    attn_layer_names[0],
+                )
+                return False
+
+        logger.info(
+            "Contiguous KV cache enabled for %d homogeneous attention layers "
+            "(num_kv_heads=%d, head_size=%d, head_size_v=%d, block_size=%d, dtype=%s)",
+            len(attn_specs),
+            first_num_kv_heads,
+            first_head_size,
+            first_head_size_v,
+            first_block_size,
+            first_dtype,
+        )
+        return True
+
+    def _allocate_contiguous_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        attn_layer_names: list[str] = []
+        first_spec: AttentionSpec | None = None
+
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                spec = layer_kv_cache_spec.get(layer_name)
+                if isinstance(spec, AttentionSpec):
+                    attn_layer_names.append(layer_name)
+                    if first_spec is None:
+                        first_spec = spec
+
+        assert first_spec is not None, "No attention specs found for contiguous allocation"
+
+        total_size = 0
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in attn_layer_names:
+                    total_size += kv_cache_tensor.size
+                    break
+
+        global_kv_tensor = torch.zeros(total_size, dtype=torch.int8, device=self.device)
+
+        kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        offset = 0
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in attn_layer_names and layer_name not in kv_cache_raw_tensors:
+                    tensor_size = kv_cache_tensor.size
+                    k_size = tensor_size // 2
+                    v_size = tensor_size - k_size
+
+                    k_tensor = global_kv_tensor[offset : offset + k_size]
+                    v_tensor = global_kv_tensor[offset + k_size : offset + tensor_size]
+                    kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
+                    offset += tensor_size
+
+        layer_names = set()
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                layer_names.add(layer_name)
+        assert set(kv_cache_raw_tensors.keys()) == set(attn_layer_names), (
+            "Some layers are not correctly initialized for contiguous KV cache"
+        )
+
+        self._contiguous_kv_cache_tensor = global_kv_tensor
+        self._contiguous_kv_cache_layer_names = attn_layer_names
+        return kv_cache_raw_tensors, global_kv_tensor
+
+    def get_all_layers_kv_cache(self) -> torch.Tensor | None:
+        if hasattr(self, "_contiguous_kv_cache_tensor"):
+            return self._contiguous_kv_cache_tensor
+        return None
+
+    def get_all_layers_kv_cache_views(
+        self,
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]] | None:
+        if not hasattr(self, "_contiguous_kv_cache_shaped_views"):
+            return None
+        return self._contiguous_kv_cache_shaped_views
 
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -2716,15 +2872,30 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, tuple(torch.Tensor, torch.Tensor)] A map between layer names
             to their corresponding memory buffer for K cache and V cache.
         """
+        self._use_contiguous_kv_cache = False
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        self.hybrid_with_attn_and_mamba = False
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            use_mamba, use_attn = False, False
+            for layer_name in kv_cache_tensor.shared_by:
+                if isinstance(layer_kv_cache_spec[layer_name], MambaSpec):
+                    use_mamba = True
+                if isinstance(layer_kv_cache_spec[layer_name], AttentionSpec):
+                    use_attn = True
+            self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
+
+        if self._can_use_contiguous_kv_cache(kv_cache_config):
+            self._use_contiguous_kv_cache = True
+            kv_cache_raw_tensors, _ = self._allocate_contiguous_kv_cache_tensors(kv_cache_config)
+            return kv_cache_raw_tensors
+
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
-        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
-        self.hybrid_with_attn_and_mamba = False
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
@@ -2860,6 +3031,14 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+
+        if getattr(self, "_use_contiguous_kv_cache", False):
+            kv_caches, shaped_views = self._reshape_contiguous_kv_cache_tensors(
+                kv_cache_config, kv_cache_raw_tensors, layer_kv_cache_spec
+            )
+            self._contiguous_kv_cache_shaped_views = shaped_views
+            return kv_caches
+
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             for layer_name in group.layer_names:
@@ -3035,6 +3214,66 @@ class NPUModelRunner(GPUModelRunner):
                     raise ValueError("Unknown KV cache spec type.")
 
         return kv_caches
+
+    def _reshape_contiguous_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        layer_kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        kv_caches: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        shaped_views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        first_spec: AttentionSpec | None = None
+        for layer_name, spec in layer_kv_cache_spec.items():
+            if isinstance(spec, AttentionSpec):
+                first_spec = spec
+                break
+
+        assert first_spec is not None, "No attention spec found for contiguous reshape"
+
+        for group in self._kv_cache_spec_attn_group_iterator():
+            attn_backend = group.backend
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+
+                current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                if not isinstance(current_kv_cache_spec, AttentionSpec):
+                    continue
+
+                raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
+                sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
+                num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                assert num_blocks >= kv_cache_config.num_blocks
+
+                kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    num_blocks,
+                    current_kv_cache_spec.block_size,
+                    current_kv_cache_spec.num_kv_heads,
+                    current_kv_cache_spec.head_size,
+                )
+
+                k_shape = kv_cache_shape[1:]
+                if hasattr(current_kv_cache_spec, "head_size_v"):
+                    v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
+                else:
+                    v_shape = k_shape
+
+                k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
+                if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
+                    k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
+                        layer_name, current_kv_cache_spec.dtype, self.model_config
+                    )
+
+                k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+                v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+
+                kv_caches[layer_name] = (k_cache, v_cache)
+                shaped_views[layer_name] = (k_cache, v_cache)
+
+        return kv_caches, shaped_views
 
     def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -3439,3 +3678,11 @@ def update_pass_config(model_runner):
         yield
     finally:
         model_runner.compilation_config.pass_config.enable_sp = original_pass_config_sp
+
+def quantize_linear(module):
+    w = module.weight.data
+    scale = getattr(module, "weight_scale", None)
+    s = None
+    if scale is not None:
+        s = scale.data.flatten()
+    return w, s

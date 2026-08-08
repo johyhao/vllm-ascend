@@ -127,6 +127,15 @@ class AscendAttentionBackend(AttentionBackend):
             value_caches[dst_indices] = value_caches[src_indices]
 
     @staticmethod
+    def copy_blocks_contiguous(
+        global_kv_cache: torch.Tensor,
+        src_to_dists: torch.Tensor,
+    ) -> None:
+        src_indices = src_to_dists[:, 0]
+        dst_indices = src_to_dists[:, 1]
+        global_kv_cache[:, :, dst_indices] = global_kv_cache[:, :, src_indices]
+
+    @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         return [128]
 
